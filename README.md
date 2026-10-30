@@ -164,6 +164,77 @@ Your repository must include:
   citations, and report generation,
 - a concise README explaining architecture, commands, and conclusions.
 
+## Implementation Summary
+
+### Architecture
+
+```mermaid
+flowchart LR
+    KB["data/knowledge_base/*.md"] --> R["src/retrieval.py<br/>chunk + embed + Qdrant"]
+    T["data/training/*.jsonl"] --> TR["src/training.py<br/>PEFT LoRA"]
+    TR --> AD["artifacts/support-lora-adapter"]
+    Q["question"] --> R --> EV["evidence above MIN_SCORE"]
+    EV --> G["src/generation.py<br/>same prompt, base or base+adapter"]
+    AD --> G
+    G --> V["citation validation<br/>answered / abstained / rejected"]
+    V --> E["src/evaluation.py"] --> REP["reports/evaluation_report.md"]
+```
+
+| Module | Role |
+|---|---|
+| [src/data_validation.py](src/data_validation.py) | Data contracts: IDs, source references, train/eval separation. |
+| [src/retrieval.py](src/retrieval.py) | Paragraph chunking with metadata, MiniLM embeddings, local Qdrant, top-k and score threshold. |
+| [src/training.py](src/training.py) | LoRA training with PEFT (r=8, alpha=16, dropout=0.05, `q_proj`/`v_proj`); loss on answer tokens only. |
+| [src/generation.py](src/generation.py) | Prompt, greedy generation, citation validation, abstention. |
+| [src/evaluation.py](src/evaluation.py) | Metrics for both paths on the same evidence and the Markdown report. |
+| [src/answer.py](src/answer.py) | Answer one question; `--mode hybrid` reloads the saved adapter. |
+| [tests/](tests/) | Fast tests (fake encoder, no downloads). CI: [.github/workflows/ci.yml](.github/workflows/ci.yml). |
+
+### Commands
+
+```bash
+uv sync
+uv run python -m src.data_validation          # validate data contracts
+uv run python -m src.retrieval                # retrieval smoke test
+uv run python -m src.training                 # train and save the adapter (~5 min on a laptop CPU)
+uv run python -m src.answer "What is the usual standard shipping time?" --mode hybrid
+uv run python -m src.evaluation               # writes reports/evaluation_report.md
+uv run pytest tests                           # run from the repo root; always pass `tests`
+```
+
+Models are loaded in float32. The SmolLM2 checkpoint defaults to bfloat16, which was
+about 150x slower per step on the CPU used here.
+
+### Results (14 held-out cases, CPU)
+
+| Metric | Baseline RAG | Hybrid RAG + LoRA |
+|---|---|---|
+| recall@3 / MRR | 1.00 / 1.00 | 1.00 / 1.00 |
+| required-term coverage | 0.30 | 0.20 |
+| citation faithfulness (of answered) | 0.71 | 0.83 |
+| style compliance | 0.93 | 0.93 |
+| decision accuracy | 0.86 | 0.86 |
+| rejected (uncited or invalid) | 0.36 | 0.43 |
+
+Full per-case evidence, failure analysis and the threshold study are in
+[reports/evaluation_report.md](reports/evaluation_report.md). The numbers come from one
+run with seed 42 on 14 cases, so one case moves a metric by about 7 points.
+
+### Answers to the project questions
+
+1. **Which held-out behaviors changed after loading the adapter?** Only a few cases: `eval-passport` went from answered to rejected, `eval-duplicate-payment` lost required-term coverage, and the wording changed on several others. Decisions on supported versus unsupported questions did not change.
+2. **Did the adapter improve evidence use, style, both, or neither?** Neither convincingly. Citation faithfulness rose from 0.71 to 0.83 but that is computed over fewer answered cases; term coverage fell and style compliance is unchanged.
+3. **Which retrieval errors limit both systems?** Two unsupported questions (`eval-bank-chargeback`, `eval-shipping-compensation`) retrieve a related policy above the threshold and are answered instead of abstained. Supported and unsupported top-1 scores overlap (supported 0.547–0.900, unsupported up to 0.631), so no `MIN_SCORE` separates them. Retrieval of supported cases is perfect (recall and MRR 1.00).
+4. **Does the improvement justify adapter training and maintenance?** Not on this evidence. The gains are within noise and offset by regressions. Keep the baseline as the default.
+5. **What experiment would reduce uncertainty most?** Retrain on more varied examples (including many abstentions and cited answers) with a validation split, then compare on a larger held-out set with several seeds. Also add a reranker or a stricter threshold check for the two failing unsupported cases.
+
+### Limitations
+
+- Citation validity shows a citation was retrieved, not that the claim is supported.
+- The style metric is a proxy (at most 3 sentences and 80 words).
+- Some evaluation topics overlap with training topics, which can overstate the adapter's benefit.
+- A common failure is a correct but uncited answer (for example the shipping-time answer), which the validator rejects by design.
+
 ## References & Further Reading
 
 - [Hugging Face Causal Language Modeling](https://huggingface.co/docs/transformers/tasks/language_modeling)
